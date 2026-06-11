@@ -1,0 +1,18 @@
+# Секреты и конфигурация
+.env
+
+# База данных
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
