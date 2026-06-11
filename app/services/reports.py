@@ -1,42 +1,54 @@
-"""Формирование текстов: карточка инвестора, сводные отчеты, топы роста/падения."""
+"""Формирование контента в формате Rich Messages (Bot API 10.1).
+
+Все тексты собираются в расширенном rich-HTML: заголовки <h3>, нативные
+таблицы <table>, абзацы <p>. Отправляются через app.services.rich
+(методы sendRichMessage / editMessageText с rich_message).
+"""
 import logging
 
 from app.database import Database
 from app.services.coingecko import CoinGeckoClient, CoinGeckoError
+from app.services.rich import esc, render_table
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Форматтеры значений (без символа $ — он добавляется в подписи колонок/итогов)
+# ---------------------------------------------------------------------------
+
 def fmt_usd(value: float) -> str:
-    """Форматирует сумму в долларах: крупные — 2 знака, мелкие — до 6."""
-    if value >= 1:
-        return f"${value:,.2f}"
-    return f"${value:.6f}"
+    """Сумма в долларах: крупные — 2 знака, мелкие — до 6."""
+    if value >= 1 or value == 0:
+        return f"{value:,.2f}"
+    return f"{value:.6f}"
 
 
 def fmt_amount(value: float) -> str:
-    """Форматирует количество монет без лишних нулей."""
+    """Количество монет без хвостовых нулей."""
     return f"{value:,.8f}".rstrip("0").rstrip(".")
 
 
 def fmt_change(change: float) -> str:
-    """Форматирует изменение за 24ч со знаком и эмодзи-направлением."""
-    arrow = "🟢" if change >= 0 else "🔴"
-    return f"{arrow} {change:+.2f}%"
+    """Изменение за 24ч со знаком, например «+4.20%» или «-1.50%»."""
+    return f"{change:+.2f}%"
 
+
+# ---------------------------------------------------------------------------
+# Карточка инвестора
+# ---------------------------------------------------------------------------
 
 async def build_investor_card(db: Database, api: CoinGeckoClient, investor_id: int) -> str:
-    """Текст карточки инвестора: активы, цены, стоимость позиций и общий баланс."""
+    """Rich-карточка инвестора: заголовок + таблица активов + итоговый баланс."""
     investor = await db.get_investor(investor_id)
     if investor is None:
-        return "⚠️ Инвестор не найден (возможно, был удален)."
+        return "<p>⚠️ Инвестор не найден (возможно, был удалён).</p>"
 
     assets = await db.get_portfolio(investor_id)
-    lines = [f"👤 <b>{investor['name']}</b>\n"]
+    header = f"<h3>📊 Портфель инвестора: {esc(investor['name'])}</h3>"
 
     if not assets:
-        lines.append("Портфель пуст. Добавьте первый актив 👇")
-        return "\n".join(lines)
+        return f"{header}<p>Портфель пуст. Добавьте первый актив 👇</p>"
 
     tickers = [a["asset_ticker"] for a in assets]
     try:
@@ -45,56 +57,72 @@ async def build_investor_card(db: Database, api: CoinGeckoClient, investor_id: i
         logger.warning("Ошибка CoinGecko при построении карточки: %s", e)
         prices = {}
 
+    # Строки таблицы: Токен | Кол-во | Курс ($) | Всего ($)
+    rows: list[list[str]] = []
     total = 0.0
     for asset in assets:
         ticker, amount = asset["asset_ticker"], asset["amount"]
         info = prices.get(ticker)
         if info is None:
-            lines.append(f"• <b>{ticker}</b> — {fmt_amount(amount)} шт (цена недоступна)")
+            rows.append([ticker, fmt_amount(amount), "—", "—"])
             continue
         position_value = amount * info.price_usd
         total += position_value
-        lines.append(
-            f"• <b>{ticker}</b> — {fmt_amount(amount)} шт × {fmt_usd(info.price_usd)} "
-            f"= <b>{fmt_usd(position_value)}</b> ({fmt_change(info.change_24h)})"
-        )
+        rows.append([
+            ticker,
+            fmt_amount(amount),
+            fmt_usd(info.price_usd),
+            fmt_usd(position_value),
+        ])
 
-    lines.append(f"\n💰 <b>Общий баланс: {fmt_usd(total)}</b>")
+    table = render_table(["Токен", "Кол-во", "Курс ($)", "Всего ($)"], rows)
+
+    parts = [header, table, f"<p>💰 <b>Общий баланс: {fmt_usd(total)} $</b></p>"]
     if len(prices) < len(tickers):
-        lines.append("\n⚠️ Часть цен недоступна, баланс может быть неполным.")
-    return "\n".join(lines)
+        parts.append("<p>⚠️ Часть цен недоступна, баланс может быть неполным.</p>")
+    return "".join(parts)
 
+
+# ---------------------------------------------------------------------------
+# Топ роста / падения
+# ---------------------------------------------------------------------------
 
 async def build_top_movers(db: Database, api: CoinGeckoClient, gainers: bool) -> str:
-    """Топ роста (gainers=True) или падения (gainers=False) за 24ч по монетам из портфелей."""
+    """Rich-таблица топа роста (gainers=True) или падения за 24ч."""
     tickers = await db.get_unique_tickers()
     if not tickers:
-        return "В портфелях пока нет ни одной монеты."
+        return "<p>В портфелях пока нет ни одной монеты.</p>"
 
     try:
         prices = await api.get_prices(tickers)
     except CoinGeckoError as e:
-        return f"⚠️ Не удалось получить данные: {e}"
+        return f"<p>⚠️ Не удалось получить данные: {esc(e)}</p>"
 
     if not prices:
-        return "⚠️ Не удалось получить цены ни по одной монете."
+        return "<p>⚠️ Не удалось получить цены ни по одной монете.</p>"
 
-    # Сортируем по изменению за 24ч в нужном направлении
-    movers = sorted(prices.values(), key=lambda p: p.change_24h, reverse=gainers)
-    title = "📈 <b>Топ роста за 24ч</b>" if gainers else "📉 <b>Топ падения за 24ч</b>"
-    lines = [title + "\n"]
-    for i, info in enumerate(movers[:10], start=1):
-        lines.append(
-            f"{i}. <b>{info.ticker}</b>: {fmt_change(info.change_24h)} — {fmt_usd(info.price_usd)}"
-        )
-    return "\n".join(lines)
+    movers = sorted(prices.values(), key=lambda p: p.change_24h, reverse=gainers)[:10]
+    title = "📈 Топ роста за 24ч" if gainers else "📉 Топ падения за 24ч"
+
+    rows = [
+        [info.ticker, fmt_change(info.change_24h), fmt_usd(info.price_usd)]
+        for info in movers
+    ]
+    table = render_table(["Токен", "Изм. 24ч", "Курс ($)"], rows)
+    return f"<h3>{title}</h3>{table}"
 
 
-async def build_summary_report(db: Database, api: CoinGeckoClient, title: str = "📋 <b>Общий отчет</b>") -> str:
-    """Сводка по всем инвесторам: состав портфелей, балансы, динамика за день."""
+# ---------------------------------------------------------------------------
+# Сводный отчёт по всем инвесторам
+# ---------------------------------------------------------------------------
+
+async def build_summary_report(
+    db: Database, api: CoinGeckoClient, title: str = "📋 Общий отчёт"
+) -> str:
+    """Rich-сводка: таблица Инвестор | Баланс ($) | Изм. 24ч (%) + общий итог."""
     holdings = await db.get_all_holdings()
     if not holdings:
-        return "Инвесторы пока не добавлены."
+        return "<p>Инвесторы пока не добавлены.</p>"
 
     tickers = list({h["asset_ticker"] for h in holdings if h["asset_ticker"]})
     prices = {}
@@ -104,38 +132,40 @@ async def build_summary_report(db: Database, api: CoinGeckoClient, title: str = 
         except CoinGeckoError as e:
             logger.warning("Ошибка CoinGecko при построении сводки: %s", e)
 
-    lines = [title + "\n"]
+    # Агрегируем балансы по инвесторам (порядок dict == ORDER BY name из SQL)
+    agg: dict[str, dict[str, float]] = {}
     grand_total = 0.0
     grand_total_yesterday = 0.0
-    current_investor = None
 
     for row in holdings:
-        if row["investor_name"] != current_investor:
-            # Начинается блок нового инвестора
-            current_investor = row["investor_name"]
-            lines.append(f"\n👤 <b>{current_investor}</b>")
-
+        stats = agg.setdefault(row["investor_name"], {"total": 0.0, "yesterday": 0.0})
         if row["asset_ticker"] is None:
-            lines.append("   — портфель пуст")
-            continue
-
+            continue  # инвестор без активов — попадёт в таблицу с нулевым балансом
         info = prices.get(row["asset_ticker"])
         if info is None:
-            lines.append(f"   • {row['asset_ticker']}: {fmt_amount(row['amount'])} шт (цена недоступна)")
-            continue
-
+            continue  # цена недоступна — позицию не учитываем
         value = row["amount"] * info.price_usd
+        stats["total"] += value
         grand_total += value
-        # Восстанавливаем стоимость сутки назад из текущей цены и изменения за 24ч
+        # Стоимость сутки назад восстанавливаем из текущей цены и изменения за 24ч
         if info.change_24h > -100:
-            grand_total_yesterday += value / (1 + info.change_24h / 100)
-        lines.append(
-            f"   • {row['asset_ticker']}: {fmt_amount(row['amount'])} шт = "
-            f"{fmt_usd(value)} ({fmt_change(info.change_24h)})"
-        )
+            yesterday = value / (1 + info.change_24h / 100)
+            stats["yesterday"] += yesterday
+            grand_total_yesterday += yesterday
 
-    lines.append(f"\n💰 <b>Суммарный баланс: {fmt_usd(grand_total)}</b>")
+    rows: list[list[str]] = []
+    for name, stats in agg.items():
+        if stats["yesterday"] > 0:
+            change_str = fmt_change((stats["total"] / stats["yesterday"] - 1) * 100)
+        else:
+            change_str = "—"
+        rows.append([name, fmt_usd(stats["total"]), change_str])
+
+    table = render_table(["Инвестор", "Баланс ($)", "Изм. 24ч (%)"], rows)
+
+    parts = [f"<h3>{esc(title)}</h3>", table,
+             f"<p>💰 <b>Суммарный баланс: {fmt_usd(grand_total)} $</b></p>"]
     if grand_total_yesterday > 0:
         day_change = (grand_total / grand_total_yesterday - 1) * 100
-        lines.append(f"📊 Динамика за 24ч: {fmt_change(day_change)}")
-    return "\n".join(lines)
+        parts.append(f"<p>📊 <b>Динамика за 24ч: {fmt_change(day_change)}</b></p>")
+    return "".join(parts)

@@ -11,6 +11,7 @@ from app.handlers.start import safe_edit
 from app.keyboards import inline
 from app.services.coingecko import CoinGeckoClient, CoinGeckoError
 from app.services.reports import build_investor_card
+from app.services.rich import edit_rich_message, send_rich_message
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -42,13 +43,17 @@ def _parse_amount(text: str) -> float | None:
 
 async def show_investor_card(message: Message, db: Database, api: CoinGeckoClient,
                              investor_id: int, edit: bool = True) -> None:
-    """Показывает карточку инвестора (редактирует сообщение или шлет новое)."""
-    text = await build_investor_card(db, api, investor_id)
+    """Показывает rich-карточку инвестора (нативная таблица активов).
+
+    edit=True — заменяет содержимое текущего сообщения (навигация по меню),
+    edit=False — отправляет новое сообщение (после ввода данных пользователем).
+    """
+    html = await build_investor_card(db, api, investor_id)
     markup = inline.investor_menu(investor_id)
     if edit:
-        await safe_edit(message, text, markup)
+        await edit_rich_message(message.bot, message.chat.id, message.message_id, html, markup)
     else:
-        await message.answer(text, reply_markup=markup)
+        await send_rich_message(message.bot, message.chat.id, html, markup)
 
 
 # ---------- Список инвесторов ----------

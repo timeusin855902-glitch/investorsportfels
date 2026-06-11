@@ -15,6 +15,7 @@ from app.config import Config
 from app.database import Database
 from app.services.coingecko import CoinGeckoClient, CoinGeckoError
 from app.services.reports import build_summary_report, fmt_usd
+from app.services.rich import esc, send_rich_message
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +45,13 @@ async def send_daily_report(bot: Bot, db: Database, api: CoinGeckoClient,
                        "Назначьте чат кнопкой в меню «Настройки».")
         return
     try:
-        text = await build_summary_report(
-            db, api, title="🗞 <b>Регулярный отчет по портфелям</b>"
+        html = await build_summary_report(
+            db, api, title="🗞 Регулярный отчёт по портфелям"
         )
-        await bot.send_message(chat_id, text)
-        logger.info("Сводный отчет отправлен в чат %s", chat_id)
+        await send_rich_message(bot, chat_id, html)
+        logger.info("Сводный отчёт отправлен в чат %s", chat_id)
     except Exception:
-        logger.exception("Ошибка при отправке сводного отчета")
+        logger.exception("Ошибка при отправке сводного отчёта")
 
 
 async def check_volatility(bot: Bot, db: Database, api: CoinGeckoClient,
@@ -83,13 +84,16 @@ async def check_volatility(bot: Bot, db: Database, api: CoinGeckoClient,
 
         direction = "рост" if info.change_24h > 0 else "падение"
         emoji = "🚀" if info.change_24h > 0 else "📉"
+        # Rich-алерт: заголовок + цитата с жирными триггерами для привлечения внимания
+        html = (
+            "<h3>🚨 Внимание! Резкое движение цены</h3>"
+            f"<blockquote>{emoji} Актив <b>{esc(info.ticker)}</b> показал {direction} "
+            f"на <b>{info.change_24h:+.1f}%</b> за последние 24 часа!<br>"
+            f"Текущая цена: <b>${fmt_usd(info.price_usd)}</b>"
+            "<cite>Источник: CoinGecko</cite></blockquote>"
+        )
         try:
-            await bot.send_message(
-                chat_id,
-                f"🚨 <b>Внимание!</b> Актив <b>{info.ticker}</b> показал {direction} "
-                f"на {info.change_24h:+.1f}% за последние 24 часа! {emoji}\n"
-                f"Текущая цена: {fmt_usd(info.price_usd)}",
-            )
+            await send_rich_message(bot, chat_id, html)
             logger.info("Алерт по %s (%+.1f%%) отправлен", info.ticker, info.change_24h)
         except Exception:
             logger.exception("Ошибка при отправке алерта по %s", info.ticker)
