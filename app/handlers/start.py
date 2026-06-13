@@ -1,6 +1,6 @@
 """Команда /start, главное меню и глобальная кнопка «🏠 Главное меню»."""
 from aiogram import F, Router
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
@@ -61,6 +61,43 @@ async def cmd_unsetforum(message: Message, db: Database) -> None:
     """Отключает отправку персональных отчётов/алертов в форум-темы."""
     await db.set_setting("forum_chat_id", "")
     await message.answer("✅ Форум-группа для персональных тем отключена.")
+
+
+@router.message(Command("bindtopic"))
+async def cmd_bindtopic(message: Message, command: CommandObject, db: Database) -> None:
+    """Привязывает ТЕКУЩУЮ тему к инвестору: его алерты/отчёты пойдут именно сюда.
+
+    Вызывать ВНУТРИ нужной темы: /bindtopic Имя инвестора
+    """
+    chat = message.chat
+    if chat.type != "supergroup" or not getattr(chat, "is_forum", False):
+        await message.answer("⚠️ Команду нужно вызвать в форум-супергруппе с «Темами».")
+        return
+    # Сообщение в General не относится к теме — message_thread_id отсутствует
+    thread_id = message.message_thread_id
+    if thread_id is None:
+        await message.answer("⚠️ Вызовите команду ВНУТРИ нужной темы инвестора, а не в General.")
+        return
+
+    name = (command.args or "").strip()
+    investors = await db.get_investors()
+    if not name:
+        names = ", ".join(i["name"] for i in investors) or "— (сначала добавьте инвесторов)"
+        await message.answer(f"Укажите инвестора: <code>/bindtopic Имя</code>\nДоступны: {names}")
+        return
+
+    investor = await db.find_investor_by_name(name)
+    if investor is None:
+        await message.answer(f"⚠️ Инвестор «{name}» не найден. Проверьте имя.")
+        return
+
+    # Запоминаем эту группу как форум и привязываем тему к инвестору
+    await db.set_setting("forum_chat_id", str(chat.id))
+    await db.set_investor_thread(investor["id"], thread_id)
+    await message.answer(
+        f"✅ Тема привязана к инвестору <b>{investor['name']}</b>.\n"
+        "Сюда будут приходить его персональные отчёты и алерты по его монетам."
+    )
 
 
 @router.message(F.text == reply.HOME)
