@@ -1,269 +1,429 @@
-"""Раздел «Инвесторы»: список, карточка портфеля и все операции над активами."""
+"""Раздел «Инвесторы»: карточка портфеля, точки входа, продажи, удаление."""
 import logging
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import Message
 
 from app.database import Database
-from app.handlers.start import safe_edit
-from app.keyboards import inline
+from app.handlers.common import send_rich
+from app.keyboards import reply
 from app.services.coingecko import CoinGeckoClient, CoinGeckoError
-from app.services.reports import build_investor_card
-from app.services.rich import edit_rich_message, send_rich_message
+from app.services.pnl import build_investor_pnl
+from app.services.reports import build_investor_card, fmt_usd
+from app.states import St
+from app.utils import parse_date, parse_positive_float, today_str
 
 logger = logging.getLogger(__name__)
 router = Router()
 
 
-# ---------- FSM-состояния диалогов ----------
+# ---------------------------------------------------------------------------
+# Показ экранов
+# ---------------------------------------------------------------------------
 
-class AddInvestor(StatesGroup):
-    name = State()          # ожидаем имя нового инвестора
-
-
-class AddAsset(StatesGroup):
-    ticker = State()        # ожидаем тикер монеты
-    amount = State()        # ожидаем количество
-
-
-class EditAsset(StatesGroup):
-    amount = State()        # ожидаем новое количество для выбранного актива
-
-
-def _parse_amount(text: str) -> float | None:
-    """Парсит количество монет: поддерживает запятую, требует значение > 0."""
-    try:
-        value = float(text.replace(",", ".").replace(" ", ""))
-    except ValueError:
-        return None
-    return value if value > 0 else None
+async def show_investors_list(message: Message, db: Database, state: FSMContext) -> None:
+    """Список инвесторов в виде reply-кнопок."""
+    investors = await db.get_investors()
+    await state.set_state(St.investors)
+    text = ("👥 <b>Инвесторы</b>\n\nВыберите инвестора или добавьте нового:"
+            if investors else "👥 <b>Инвесторы</b>\n\nСписок пуст — добавьте первого:")
+    await message.answer(text, reply_markup=reply.investors_list(investors))
 
 
 async def show_investor_card(message: Message, db: Database, api: CoinGeckoClient,
-                             investor_id: int, edit: bool = True) -> None:
-    """Показывает rich-карточку инвестора (нативная таблица активов).
-
-    edit=True — заменяет содержимое текущего сообщения (навигация по меню),
-    edit=False — отправляет новое сообщение (после ввода данных пользователем).
-    """
+                             state: FSMContext, investor_id: int) -> None:
+    """Rich-карточка портфеля инвестора + меню действий."""
+    investor = await db.get_investor(investor_id)
+    if investor is None:
+        await message.answer("⚠️ Инвестор не найден.")
+        await show_investors_list(message, db, state)
+        return
+    await state.set_state(St.investor)
+    await state.update_data(inv_id=investor_id, inv_name=investor["name"])
     html = await build_investor_card(db, api, investor_id)
-    markup = inline.investor_menu(investor_id)
-    if edit:
-        await edit_rich_message(message.bot, message.chat.id, message.message_id, html, markup)
-    else:
-        await send_rich_message(message.bot, message.chat.id, html, markup)
+    await send_rich(message, html, reply.investor_actions())
 
 
-# ---------- Список инвесторов ----------
-
-@router.callback_query(F.data == "menu_investors")
-async def list_investors(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
-    await state.clear()
-    investors = await db.get_investors()
-    text = "👥 <b>Инвесторы</b>\n\nВыберите инвестора или добавьте нового:" if investors \
-        else "👥 <b>Инвесторы</b>\n\nСписок пуст — добавьте первого инвестора:"
-    await safe_edit(callback.message, text, inline.investors_list(investors))
-    await callback.answer()
+async def _current_investor_id(state: FSMContext) -> int | None:
+    data = await state.get_data()
+    return data.get("inv_id")
 
 
-@router.callback_query(F.data.startswith("inv:"))
-async def open_investor(callback: CallbackQuery, db: Database, api: CoinGeckoClient,
+# ---------------------------------------------------------------------------
+# Вход в раздел и выбор инвестора
+# ---------------------------------------------------------------------------
+
+@router.message(St.main, F.text == reply.INVESTORS)
+async def open_investors(message: Message, db: Database, state: FSMContext) -> None:
+    await show_investors_list(message, db, state)
+
+
+@router.message(St.investors, F.text == reply.ADD_INVESTOR)
+async def add_investor_start(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.add_investor)
+    await message.answer("✍️ Введите имя нового инвестора:", reply_markup=reply.back_only())
+
+
+@router.message(St.investors)
+async def pick_investor(message: Message, db: Database, api: CoinGeckoClient,
                         state: FSMContext) -> None:
-    await state.clear()
-    investor_id = int(callback.data.split(":")[1])
-    await callback.answer("Загружаю цены…")
-    await show_investor_card(callback.message, db, api, investor_id)
+    """Выбор инвестора по имени с кнопки."""
+    investor = await db.find_investor_by_name(message.text.strip())
+    if investor is None:
+        await message.answer("⚠️ Выберите инвестора кнопкой из списка.")
+        await show_investors_list(message, db, state)
+        return
+    await show_investor_card(message, db, api, state, investor["id"])
 
 
-# ---------- Добавление инвестора ----------
-
-@router.callback_query(F.data == "inv_add")
-async def add_investor_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AddInvestor.name)
-    await safe_edit(callback.message, "✍️ Введите имя нового инвестора:", inline.cancel_input())
-    await callback.answer()
+@router.message(St.add_investor, F.text == reply.BACK)
+async def add_investor_back(message: Message, db: Database, state: FSMContext) -> None:
+    await show_investors_list(message, db, state)
 
 
-@router.message(AddInvestor.name, F.text)
-async def add_investor_name(message: Message, state: FSMContext, db: Database) -> None:
+@router.message(St.add_investor)
+async def add_investor_name(message: Message, db: Database, api: CoinGeckoClient,
+                            state: FSMContext) -> None:
     name = message.text.strip()
     if not name or len(name) > 64:
-        await message.answer("⚠️ Имя должно быть от 1 до 64 символов. Попробуйте еще раз:")
+        await message.answer("⚠️ Имя должно быть 1–64 символа. Повторите:")
         return
-    await state.clear()
-    await db.add_investor(name)
-    investors = await db.get_investors()
+    investor_id = await db.add_investor(name)
+    await message.answer(f"✅ Инвестор <b>{name}</b> добавлен!")
+    await show_investor_card(message, db, api, state, investor_id)
+
+
+# ---------------------------------------------------------------------------
+# Меню карточки инвестора
+# ---------------------------------------------------------------------------
+
+@router.message(St.investor, F.text == reply.BACK)
+async def card_back(message: Message, db: Database, state: FSMContext) -> None:
+    await show_investors_list(message, db, state)
+
+
+@router.message(St.investor, F.text == reply.INVESTOR_PNL)
+async def card_pnl(message: Message, db: Database, api: CoinGeckoClient,
+                   state: FSMContext) -> None:
+    inv_id = await _current_investor_id(state)
+    if inv_id is None:
+        await show_investors_list(message, db, state)
+        return
+    html = await build_investor_pnl(db, api, inv_id)
+    await send_rich(message, html, reply.investor_actions())
+
+
+# ---- Добавление актива (точка входа) ----
+
+@router.message(St.investor, F.text == reply.ADD_ASSET)
+async def add_asset_start(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.a_ticker)
     await message.answer(
-        f"✅ Инвестор <b>{name}</b> добавлен!",
-        reply_markup=inline.investors_list(investors),
-    )
-
-
-# ---------- Добавление актива ----------
-
-@router.callback_query(F.data.startswith("asset_add:"))
-async def add_asset_start(callback: CallbackQuery, state: FSMContext) -> None:
-    investor_id = int(callback.data.split(":")[1])
-    await state.set_state(AddAsset.ticker)
-    await state.update_data(investor_id=investor_id)
-    await safe_edit(
-        callback.message,
         "✍️ Введите тикер монеты (например, <code>BTC</code> или <code>ZEC</code>):",
-        inline.cancel_input(),
+        reply_markup=reply.back_only(),
     )
-    await callback.answer()
 
 
-@router.message(AddAsset.ticker, F.text)
-async def add_asset_ticker(message: Message, state: FSMContext, api: CoinGeckoClient) -> None:
+@router.message(St.a_ticker, F.text == reply.BACK)
+async def add_asset_ticker_back(message: Message, db: Database, api: CoinGeckoClient,
+                                state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.a_ticker)
+async def add_asset_ticker(message: Message, api: CoinGeckoClient, state: FSMContext) -> None:
     ticker = message.text.strip().upper()
     if not ticker.isalnum() or len(ticker) > 15:
-        await message.answer("⚠️ Тикер — до 15 букв/цифр. Попробуйте еще раз:")
+        await message.answer("⚠️ Тикер — до 15 букв/цифр. Повторите:")
         return
-
-    # Проверяем, что монета существует на CoinGecko, до записи в БД
     try:
         coin_id = await api.resolve_ticker(ticker)
     except CoinGeckoError as e:
-        await message.answer(f"⚠️ {e}\nПопробуйте еще раз чуть позже:")
+        await message.answer(f"⚠️ {e}\nПопробуйте ещё раз:")
         return
     if coin_id is None:
-        await message.answer(
-            f"⚠️ Монета <b>{ticker}</b> не найдена на CoinGecko. Проверьте тикер:"
-        )
+        await message.answer(f"⚠️ Монета <b>{ticker}</b> не найдена на CoinGecko. Проверьте тикер:")
         return
-
-    await state.update_data(ticker=ticker)
-    await state.set_state(AddAsset.amount)
+    await state.update_data(t_ticker=ticker)
+    await state.set_state(St.a_price)
     await message.answer(
-        f"Тикер <b>{ticker}</b> найден ✅\n✍️ Теперь введите количество монет:",
-        reply_markup=inline.cancel_input(),
+        f"Монета <b>{ticker}</b> найдена ✅\n💵 Введите цену покупки за 1 монету (в $):",
+        reply_markup=reply.back_only(),
     )
 
 
-@router.message(AddAsset.amount, F.text)
-async def add_asset_amount(message: Message, state: FSMContext, db: Database,
-                           api: CoinGeckoClient) -> None:
-    amount = _parse_amount(message.text)
-    if amount is None:
-        await message.answer("⚠️ Введите положительное число, например <code>0.5</code>:")
+@router.message(St.a_price, F.text == reply.BACK)
+async def add_asset_price_back(message: Message, db: Database, api: CoinGeckoClient,
+                               state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.a_price)
+async def add_asset_price(message: Message, state: FSMContext) -> None:
+    price = parse_positive_float(message.text)
+    if price is None:
+        await message.answer("⚠️ Введите цену числом больше 0, например <code>65000</code>:")
         return
+    await state.update_data(t_price=price)
+    await state.set_state(St.a_amount)
+    await message.answer("📦 Введите количество монет:", reply_markup=reply.back_only())
+
+
+@router.message(St.a_amount, F.text == reply.BACK)
+async def add_asset_amount_back(message: Message, db: Database, api: CoinGeckoClient,
+                                state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.a_amount)
+async def add_asset_amount(message: Message, state: FSMContext) -> None:
+    amount = parse_positive_float(message.text)
+    if amount is None:
+        await message.answer("⚠️ Введите количество числом больше 0, например <code>0.5</code>:")
+        return
+    await state.update_data(t_amount=amount)
+    await state.set_state(St.a_date)
+    await message.answer(
+        "📅 Введите дату покупки (ДД.ММ.ГГГГ)\n"
+        "или нажмите «⏭ Пропустить» — бот определит дату по цене через CoinGecko:",
+        reply_markup=reply.skip_or_back(),
+    )
+
+
+@router.message(St.a_date, F.text == reply.BACK)
+async def add_asset_date_back(message: Message, db: Database, api: CoinGeckoClient,
+                              state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.a_date)
+async def add_asset_date(message: Message, db: Database, api: CoinGeckoClient,
+                         state: FSMContext) -> None:
+    data = await state.get_data()
+    ticker, price, amount = data["t_ticker"], data["t_price"], data["t_amount"]
+
+    if message.text.strip() == reply.SKIP:
+        # Автоопределение даты по цене через исторический график
+        await message.answer("⏳ Ищу дату по цене через CoinGecko…")
+        try:
+            date = await api.find_date_for_price(ticker, price)
+        except CoinGeckoError:
+            date = None
+        if date:
+            await message.answer(f"📅 Найдена примерная дата: <b>{date}</b>")
+        else:
+            date = today_str()
+            await message.answer(f"⚠️ Не удалось определить дату, поставил текущую: {date}")
+    else:
+        date = parse_date(message.text)
+        if date is None:
+            await message.answer("⚠️ Неверный формат. Введите дату как ДД.ММ.ГГГГ:")
+            return
+
+    await db.add_transaction(data["inv_id"], ticker, "buy", price, amount, date)
+    await message.answer(
+        f"✅ Куплено: <b>{ticker}</b> — {amount:g} шт по {fmt_usd(price)} $ "
+        f"(сумма {fmt_usd(price * amount)} $), дата {date}"
+    )
+    await show_investor_card(message, db, api, state, data["inv_id"])
+
+
+# ---- Продажа актива ----
+
+@router.message(St.investor, F.text == reply.SELL_ASSET)
+async def sell_start(message: Message, db: Database, state: FSMContext) -> None:
+    inv_id = await _current_investor_id(state)
+    assets = await db.get_portfolio(inv_id)
+    if not assets:
+        await message.answer("В портфеле нет активов для продажи.",
+                             reply_markup=reply.investor_actions())
+        return
+    await state.set_state(St.s_pick)
+    pairs = [(a["asset_ticker"], a["amount"]) for a in assets]
+    await message.answer("💰 Выберите актив для продажи:",
+                         reply_markup=reply.tickers_list(pairs))
+
+
+@router.message(St.s_pick, F.text == reply.BACK)
+async def sell_pick_back(message: Message, db: Database, api: CoinGeckoClient,
+                         state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.s_pick)
+async def sell_pick(message: Message, db: Database, state: FSMContext) -> None:
+    ticker = message.text.split("—")[0].strip().upper()
+    inv_id = await _current_investor_id(state)
+    remaining = await db.remaining_amount(inv_id, ticker)
+    if remaining <= 0:
+        await message.answer("⚠️ Выберите актив кнопкой из списка.")
+        return
+    await state.update_data(sell_ticker=ticker, sell_remaining=remaining)
+    await state.set_state(St.s_price)
+    await message.answer(
+        f"Остаток <b>{ticker}</b>: {remaining:g} шт\n💵 Введите цену продажи за 1 монету (в $):",
+        reply_markup=reply.back_only(),
+    )
+
+
+@router.message(St.s_price, F.text == reply.BACK)
+async def sell_price_back(message: Message, db: Database, api: CoinGeckoClient,
+                          state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.s_price)
+async def sell_price(message: Message, state: FSMContext) -> None:
+    price = parse_positive_float(message.text)
+    if price is None:
+        await message.answer("⚠️ Введите цену числом больше 0:")
+        return
+    await state.update_data(sell_price=price)
+    await state.set_state(St.s_amount)
+    await message.answer("📦 Введите количество для продажи:", reply_markup=reply.back_only())
+
+
+@router.message(St.s_amount, F.text == reply.BACK)
+async def sell_amount_back(message: Message, db: Database, api: CoinGeckoClient,
+                           state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.s_amount)
+async def sell_amount(message: Message, state: FSMContext) -> None:
+    amount = parse_positive_float(message.text)
+    if amount is None:
+        await message.answer("⚠️ Введите количество числом больше 0:")
+        return
+    data = await state.get_data()
+    if amount > data["sell_remaining"] + 1e-9:
+        await message.answer(
+            f"⚠️ Недостаточно. Остаток: {data['sell_remaining']:g} шт. Введите меньше:")
+        return
+    await state.update_data(sell_amount=amount)
+    await state.set_state(St.s_date)
+    await message.answer(
+        "📅 Введите дату продажи (ДД.ММ.ГГГГ) или «⏭ Пропустить» для текущей:",
+        reply_markup=reply.skip_or_back(),
+    )
+
+
+@router.message(St.s_date, F.text == reply.BACK)
+async def sell_date_back(message: Message, db: Database, api: CoinGeckoClient,
+                         state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.s_date)
+async def sell_date(message: Message, db: Database, api: CoinGeckoClient,
+                    state: FSMContext) -> None:
+    if message.text.strip() == reply.SKIP:
+        date = today_str()
+    else:
+        date = parse_date(message.text)
+        if date is None:
+            await message.answer("⚠️ Неверный формат. Введите дату как ДД.ММ.ГГГГ:")
+            return
 
     data = await state.get_data()
-    await state.clear()
-    await db.add_asset(data["investor_id"], data["ticker"], amount)
-    await message.answer(f"✅ Актив <b>{data['ticker']}</b> добавлен!")
-    await show_investor_card(message, db, api, data["investor_id"], edit=False)
+    ticker = data["sell_ticker"]
+    price = data["sell_price"]
+    amount = data["sell_amount"]
+    inv_id = data["inv_id"]
+
+    await db.add_transaction(inv_id, ticker, "sell", price, amount, date)
+
+    # Реализованный P&L сделки относительно средней цены входа
+    pnl_line = ""
+    transactions = await db.get_transactions(inv_id)
+    buys = [t for t in transactions if t["asset_ticker"] == ticker and t["kind"] == "buy"]
+    buy_qty = sum(t["amount"] for t in buys)
+    buy_cost = sum(t["price"] * t["amount"] for t in buys)
+    if buy_qty > 0 and buy_cost > 0:
+        avg_buy = buy_cost / buy_qty
+        pnl = (price - avg_buy) * amount
+        pct = (price / avg_buy - 1) * 100
+        sign = "+" if pnl >= 0 else "-"
+        pnl_line = f"\n📈 P&L сделки: {sign}{fmt_usd(abs(pnl))} $ ({pct:+.2f}%)"
+
+    await message.answer(
+        f"✅ Продано: <b>{ticker}</b> — {amount:g} шт по {fmt_usd(price)} $ "
+        f"(сумма {fmt_usd(price * amount)} $), дата {date}{pnl_line}"
+    )
+    await show_investor_card(message, db, api, state, inv_id)
 
 
-# ---------- Изменение количества актива ----------
+# ---- Удаление актива (полностью) ----
 
-@router.callback_query(F.data.startswith("asset_edit:"))
-async def edit_asset_choose(callback: CallbackQuery, db: Database) -> None:
-    investor_id = int(callback.data.split(":")[1])
-    assets = await db.get_portfolio(investor_id)
+@router.message(St.investor, F.text == reply.DEL_ASSET)
+async def del_asset_start(message: Message, db: Database, state: FSMContext) -> None:
+    inv_id = await _current_investor_id(state)
+    assets = await db.get_portfolio(inv_id)
     if not assets:
-        await callback.answer("Портфель пуст — нечего изменять", show_alert=True)
+        await message.answer("В портфеле нет активов.", reply_markup=reply.investor_actions())
         return
-    await safe_edit(
-        callback.message,
-        "✏️ Выберите актив для изменения количества:",
-        inline.assets_list(assets, "edit", investor_id),
-    )
-    await callback.answer()
+    await state.set_state(St.d_pick)
+    pairs = [(a["asset_ticker"], a["amount"]) for a in assets]
+    await message.answer("🗑 Выберите актив для полного удаления (со всеми сделками):",
+                         reply_markup=reply.tickers_list(pairs))
 
 
-@router.callback_query(F.data.startswith("asset_edit_sel:"))
-async def edit_asset_start(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-    asset_id = int(callback.data.split(":")[1])
-    asset = await db.get_asset(asset_id)
-    if asset is None:
-        await callback.answer("Актив не найден", show_alert=True)
+@router.message(St.d_pick, F.text == reply.BACK)
+async def del_asset_back(message: Message, db: Database, api: CoinGeckoClient,
+                         state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.d_pick)
+async def del_asset(message: Message, db: Database, api: CoinGeckoClient,
+                    state: FSMContext) -> None:
+    ticker = message.text.split("—")[0].strip().upper()
+    inv_id = await _current_investor_id(state)
+    if await db.remaining_amount(inv_id, ticker) <= 0:
+        await message.answer("⚠️ Выберите актив кнопкой из списка.")
         return
-    await state.set_state(EditAsset.amount)
-    await state.update_data(asset_id=asset_id, investor_id=asset["investor_id"])
-    await safe_edit(
-        callback.message,
-        f"✍️ Текущее количество <b>{asset['asset_ticker']}</b>: {asset['amount']:g}\n"
-        "Введите новое количество:",
-        inline.cancel_input(),
-    )
-    await callback.answer()
+    await db.delete_asset(inv_id, ticker)
+    await message.answer(f"🗑 Актив <b>{ticker}</b> удалён со всеми сделками.")
+    await show_investor_card(message, db, api, state, inv_id)
 
 
-@router.message(EditAsset.amount, F.text)
-async def edit_asset_amount(message: Message, state: FSMContext, db: Database,
-                            api: CoinGeckoClient) -> None:
-    amount = _parse_amount(message.text)
-    if amount is None:
-        await message.answer("⚠️ Введите положительное число, например <code>1.25</code>:")
-        return
+# ---- Удаление инвестора (с подтверждением) ----
 
+@router.message(St.investor, F.text == reply.DEL_INVESTOR)
+async def del_investor_ask(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await state.clear()
-    await db.update_asset_amount(data["asset_id"], amount)
-    await message.answer("✅ Количество обновлено!")
-    await show_investor_card(message, db, api, data["investor_id"], edit=False)
-
-
-# ---------- Удаление актива ----------
-
-@router.callback_query(F.data.startswith("asset_del:"))
-async def delete_asset_choose(callback: CallbackQuery, db: Database) -> None:
-    investor_id = int(callback.data.split(":")[1])
-    assets = await db.get_portfolio(investor_id)
-    if not assets:
-        await callback.answer("Портфель пуст — нечего удалять", show_alert=True)
-        return
-    await safe_edit(
-        callback.message,
-        "❌ Выберите актив для удаления:",
-        inline.assets_list(assets, "del", investor_id),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("asset_del_sel:"))
-async def delete_asset_confirm(callback: CallbackQuery, db: Database,
-                               api: CoinGeckoClient) -> None:
-    asset_id = int(callback.data.split(":")[1])
-    asset = await db.get_asset(asset_id)
-    if asset is None:
-        await callback.answer("Актив не найден", show_alert=True)
-        return
-    await db.delete_asset(asset_id)
-    await callback.answer(f"Актив {asset['asset_ticker']} удален")
-    await show_investor_card(callback.message, db, api, asset["investor_id"])
-
-
-# ---------- Удаление инвестора (с подтверждением) ----------
-
-@router.callback_query(F.data.startswith("inv_del:"))
-async def delete_investor_ask(callback: CallbackQuery, db: Database) -> None:
-    investor_id = int(callback.data.split(":")[1])
-    investor = await db.get_investor(investor_id)
-    if investor is None:
-        await callback.answer("Инвестор не найден", show_alert=True)
-        return
-    await safe_edit(
-        callback.message,
-        f"🗑 Удалить инвестора <b>{investor['name']}</b> и все его активы?\n"
+    await state.set_state(St.del_investor)
+    await message.answer(
+        f"🗑 Удалить инвестора <b>{data.get('inv_name', '')}</b> и все его сделки?\n"
         "Действие необратимо.",
-        inline.confirm_delete_investor(investor_id),
+        reply_markup=reply.yes_no(),
     )
-    await callback.answer()
 
 
-@router.callback_query(F.data.startswith("inv_del_yes:"))
-async def delete_investor_do(callback: CallbackQuery, db: Database) -> None:
-    investor_id = int(callback.data.split(":")[1])
-    await db.delete_investor(investor_id)
-    investors = await db.get_investors()
-    await safe_edit(
-        callback.message,
-        "✅ Инвестор удален.\n\n👥 <b>Инвесторы</b>",
-        inline.investors_list(investors),
-    )
-    await callback.answer()
+@router.message(St.del_investor, F.text == reply.YES)
+async def del_investor_yes(message: Message, db: Database, state: FSMContext) -> None:
+    inv_id = await _current_investor_id(state)
+    if inv_id is not None:
+        await db.delete_investor(inv_id)
+    await message.answer("✅ Инвестор удалён.")
+    await show_investors_list(message, db, state)
+
+
+@router.message(St.del_investor)
+async def del_investor_no(message: Message, db: Database, api: CoinGeckoClient,
+                          state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+# ---------------------------------------------------------------------------
+# Возврат к карточке текущего инвестора
+# ---------------------------------------------------------------------------
+
+async def _back_to_card(message: Message, db: Database, api: CoinGeckoClient,
+                        state: FSMContext) -> None:
+    inv_id = await _current_investor_id(state)
+    if inv_id is None:
+        await show_investors_list(message, db, state)
+    else:
+        await show_investor_card(message, db, api, state, inv_id)

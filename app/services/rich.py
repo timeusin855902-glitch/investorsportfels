@@ -15,7 +15,10 @@ import logging
 
 import aiohttp
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+
+# Любая клавиатура, которую принимает Bot API в reply_markup
+Markup = InlineKeyboardMarkup | ReplyKeyboardMarkup
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +105,8 @@ def render_table(
 # Низкоуровневый вызов Bot API
 # ---------------------------------------------------------------------------
 
-def _markup_json(reply_markup: InlineKeyboardMarkup | None) -> dict | None:
-    """Сериализует клавиатуру aiogram в JSON-структуру для сырого запроса."""
+def _markup_json(reply_markup: Markup | None) -> dict | None:
+    """Сериализует клавиатуру aiogram (inline или reply) в JSON для сырого запроса."""
     if reply_markup is None:
         return None
     return reply_markup.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -128,14 +131,14 @@ async def send_rich_message(
     bot: Bot,
     chat_id: int | str,
     html: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
+    reply_markup: Markup | None = None,
     **extra,
 ) -> dict:
     """Отправляет rich-сообщение (метод sendRichMessage).
 
     Args:
         html: контент в расширенном rich-HTML (таблицы, заголовки и т.д.).
-        reply_markup: необязательная инлайн-клавиатура.
+        reply_markup: необязательная клавиатура (inline или reply).
         extra: дополнительные параметры метода (disable_notification и пр.).
     """
     payload: dict = {"chat_id": chat_id, "rich_message": {"html": html}}
@@ -144,30 +147,3 @@ async def send_rich_message(
         payload["reply_markup"] = markup
     payload.update(extra)
     return await _call(bot, "sendRichMessage", payload)
-
-
-async def edit_rich_message(
-    bot: Bot,
-    chat_id: int | str,
-    message_id: int,
-    html: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> dict | None:
-    """Заменяет содержимое сообщения на rich (editMessageText + rich_message).
-
-    Ошибку «message is not modified» молча игнорирует (как safe_edit).
-    """
-    payload: dict = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "rich_message": {"html": html},
-    }
-    markup = _markup_json(reply_markup)
-    if markup is not None:
-        payload["reply_markup"] = markup
-    try:
-        return await _call(bot, "editMessageText", payload)
-    except RichMessageError as e:
-        if "not modified" in str(e):
-            return None
-        raise

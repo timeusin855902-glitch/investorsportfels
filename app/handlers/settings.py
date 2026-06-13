@@ -1,28 +1,19 @@
-"""Раздел «Настройки»: частота отчетов, порог алертов, админы, чат для отчетов."""
+"""Раздел «Настройки»: частота отчётов, порог алертов, админы, чат для отчётов."""
 import logging
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.config import Config
 from app.database import Database
-from app.handlers.start import safe_edit
-from app.keyboards import inline
+from app.keyboards import reply
 from app.scheduler.tasks import reschedule_report
+from app.states import St
 
 logger = logging.getLogger(__name__)
 router = Router()
-
-
-class SetThreshold(StatesGroup):
-    value = State()         # ожидаем порог алерта в процентах
-
-
-class AddAdmin(StatesGroup):
-    user_id = State()       # ожидаем Telegram ID нового админа
 
 
 async def _settings_text(db: Database, config: Config) -> str:
@@ -33,77 +24,96 @@ async def _settings_text(db: Database, config: Config) -> str:
     chat_str = str(chat_id) if chat_id else "не задан ⚠️"
     return (
         "⚙️ <b>Настройки</b>\n\n"
-        f"⏰ Частота отчетов: каждые <b>{freq} ч</b>\n"
+        f"⏰ Частота отчётов: каждые <b>{freq} ч</b>\n"
         f"🚨 Порог алертов: <b>±{threshold}%</b> за 24ч\n"
-        f"📍 Чат для отчетов: <b>{chat_str}</b>"
+        f"📍 Чат для отчётов: <b>{chat_str}</b>\n\n"
+        "Выберите параметр:"
     )
 
 
-@router.callback_query(F.data == "menu_settings")
-async def show_settings(callback: CallbackQuery, db: Database, config: Config,
+async def show_settings(message: Message, db: Database, config: Config,
                         state: FSMContext) -> None:
-    await state.clear()
-    await safe_edit(callback.message, await _settings_text(db, config), inline.settings_menu())
-    await callback.answer()
+    await state.set_state(St.settings)
+    await message.answer(await _settings_text(db, config), reply_markup=reply.settings_menu())
 
 
-# ---------- Частота отчетов ----------
-
-@router.callback_query(F.data == "set_freq")
-async def choose_freq(callback: CallbackQuery) -> None:
-    await safe_edit(
-        callback.message,
-        "⏰ Как часто отправлять сводный отчет в аналитический чат?",
-        inline.report_freq_options(),
-    )
-    await callback.answer()
+@router.message(St.main, F.text == reply.SETTINGS)
+async def open_settings(message: Message, db: Database, config: Config,
+                        state: FSMContext) -> None:
+    await show_settings(message, db, config, state)
 
 
-@router.callback_query(F.data.startswith("set_freq_val:"))
-async def set_freq(callback: CallbackQuery, db: Database, config: Config,
-                   scheduler: AsyncIOScheduler) -> None:
-    hours = int(callback.data.split(":")[1])
+# ---- Частота отчётов ----
+
+@router.message(St.settings, F.text == reply.SET_FREQ)
+async def freq_menu(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.set_freq)
+    await message.answer("⏰ Как часто отправлять сводный отчёт?",
+                         reply_markup=reply.freq_menu())
+
+
+@router.message(St.set_freq, F.text == reply.BACK)
+async def freq_back(message: Message, db: Database, config: Config, state: FSMContext) -> None:
+    await show_settings(message, db, config, state)
+
+
+@router.message(St.set_freq)
+async def freq_set(message: Message, db: Database, config: Config,
+                   scheduler: AsyncIOScheduler, state: FSMContext) -> None:
+    digits = "".join(c for c in message.text if c.isdigit())
+    if digits not in {"6", "12", "24"}:
+        await message.answer("⚠️ Выберите вариант кнопкой.")
+        return
+    hours = int(digits)
     await db.set_setting("report_freq_hours", str(hours))
-    # Перепланируем фоновую задачу без перезапуска бота
     reschedule_report(scheduler, hours)
-    await callback.answer(f"Отчеты — каждые {hours} ч ✅")
-    await safe_edit(callback.message, await _settings_text(db, config), inline.settings_menu())
+    await message.answer(f"✅ Отчёты — каждые {hours} ч.")
+    await show_settings(message, db, config, state)
 
 
-# ---------- Порог алертов ----------
+# ---- Порог алертов ----
 
-@router.callback_query(F.data == "set_threshold")
-async def choose_threshold(callback: CallbackQuery) -> None:
-    await safe_edit(
-        callback.message,
-        "🚨 Выберите порог изменения цены за 24ч, при котором отправлять алерт:",
-        inline.threshold_options(),
-    )
-    await callback.answer()
+@router.message(St.settings, F.text == reply.SET_THRESHOLD)
+async def threshold_menu(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.set_threshold)
+    await message.answer("🚨 Порог изменения цены за 24ч для алерта:",
+                         reply_markup=reply.threshold_menu())
 
 
-@router.callback_query(F.data.startswith("set_threshold_val:"))
-async def set_threshold(callback: CallbackQuery, db: Database, config: Config) -> None:
-    pct = int(callback.data.split(":")[1])
-    await db.set_setting("alert_threshold", str(pct))
-    await callback.answer(f"Порог алертов — {pct}% ✅")
-    await safe_edit(callback.message, await _settings_text(db, config), inline.settings_menu())
+@router.message(St.set_threshold, F.text == reply.BACK)
+async def threshold_back(message: Message, db: Database, config: Config,
+                         state: FSMContext) -> None:
+    await show_settings(message, db, config, state)
 
 
-@router.callback_query(F.data == "set_threshold_custom")
-async def set_threshold_custom(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(SetThreshold.value)
-    await safe_edit(
-        callback.message,
-        "✍️ Введите порог в процентах (число от 1 до 500), например <code>25</code>:",
-        inline.cancel_input(),
-    )
-    await callback.answer()
+@router.message(St.set_threshold, F.text == reply.THRESHOLD_CUSTOM)
+async def threshold_custom(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.set_threshold_input)
+    await message.answer("✍️ Введите порог в процентах (число от 1 до 500):",
+                         reply_markup=reply.back_only())
 
 
-@router.message(SetThreshold.value, F.text)
-async def set_threshold_value(message: Message, state: FSMContext, db: Database,
-                              config: Config) -> None:
+@router.message(St.set_threshold)
+async def threshold_set(message: Message, db: Database, config: Config,
+                        state: FSMContext) -> None:
+    digits = "".join(c for c in message.text if c.isdigit())
+    if digits not in {"10", "20", "30", "50"}:
+        await message.answer("⚠️ Выберите вариант кнопкой или «✍️ Ввести вручную».")
+        return
+    await db.set_setting("alert_threshold", digits)
+    await message.answer(f"✅ Порог алертов — {digits}%.")
+    await show_settings(message, db, config, state)
+
+
+@router.message(St.set_threshold_input, F.text == reply.BACK)
+async def threshold_input_back(message: Message, db: Database, config: Config,
+                               state: FSMContext) -> None:
+    await show_settings(message, db, config, state)
+
+
+@router.message(St.set_threshold_input)
+async def threshold_input(message: Message, db: Database, config: Config,
+                          state: FSMContext) -> None:
     try:
         pct = float(message.text.replace(",", ".").replace("%", "").strip())
     except ValueError:
@@ -111,74 +121,79 @@ async def set_threshold_value(message: Message, state: FSMContext, db: Database,
     if not 1 <= pct <= 500:
         await message.answer("⚠️ Введите число от 1 до 500:")
         return
-    await state.clear()
     await db.set_setting("alert_threshold", f"{pct:g}")
-    await message.answer(
-        f"✅ Порог алертов установлен: ±{pct:g}%\n\n" + await _settings_text(db, config),
-        reply_markup=inline.settings_menu(),
-    )
+    await message.answer(f"✅ Порог алертов — ±{pct:g}%.")
+    await show_settings(message, db, config, state)
 
 
-# ---------- Чат для отчетов ----------
+# ---- Чат для отчётов ----
 
-@router.callback_query(F.data == "set_chat_here")
-async def set_analytics_chat(callback: CallbackQuery, db: Database, config: Config) -> None:
-    """Назначает текущий чат получателем отчетов и алертов."""
-    chat_id = callback.message.chat.id
-    await db.set_setting("analytics_chat_id", str(chat_id))
-    await callback.answer("Этот чат назначен для отчетов ✅", show_alert=True)
-    await safe_edit(callback.message, await _settings_text(db, config), inline.settings_menu())
+@router.message(St.settings, F.text == reply.SET_CHAT_HERE)
+async def set_chat_here(message: Message, db: Database, config: Config,
+                        state: FSMContext) -> None:
+    await db.set_setting("analytics_chat_id", str(message.chat.id))
+    await message.answer("📍 Этот чат назначен для отчётов и алертов ✅")
+    await show_settings(message, db, config, state)
 
 
-# ---------- Управление админами ----------
+# ---- Админы ----
 
 async def _admins_text(db: Database, config: Config) -> str:
     owners = ", ".join(str(u) for u in sorted(config.allowed_users))
     return (
         "👮 <b>Админы</b>\n\n"
-        f"Владельцы из .env (нельзя удалить): <code>{owners}</code>\n\n"
-        "Добавленные через меню (нажмите, чтобы удалить):"
+        f"Владельцы из .env (неудаляемы): <code>{owners}</code>\n\n"
+        "Добавленные через меню — нажмите «🗑 ID», чтобы удалить:"
     )
 
 
-@router.callback_query(F.data == "set_admins")
-async def show_admins(callback: CallbackQuery, db: Database, config: Config) -> None:
+@router.message(St.settings, F.text == reply.SET_ADMINS)
+async def admins_menu(message: Message, db: Database, config: Config,
+                      state: FSMContext) -> None:
+    await state.set_state(St.set_admins)
     db_admins = await db.get_admins()
-    await safe_edit(callback.message, await _admins_text(db, config), inline.admins_menu(db_admins))
-    await callback.answer()
+    await message.answer(await _admins_text(db, config),
+                         reply_markup=reply.admins_menu(db_admins))
 
 
-@router.callback_query(F.data == "admin_add")
-async def add_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AddAdmin.user_id)
-    await safe_edit(
-        callback.message,
-        "✍️ Введите Telegram ID нового админа (узнать ID можно у @userinfobot):",
-        inline.cancel_input(),
-    )
-    await callback.answer()
+@router.message(St.set_admins, F.text == reply.BACK)
+async def admins_back(message: Message, db: Database, config: Config, state: FSMContext) -> None:
+    await show_settings(message, db, config, state)
 
 
-@router.message(AddAdmin.user_id, F.text)
-async def add_admin_finish(message: Message, state: FSMContext, db: Database,
-                           config: Config) -> None:
+@router.message(St.set_admins, F.text == reply.ADD_ADMIN)
+async def admin_add_start(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.set_admin_add)
+    await message.answer("✍️ Введите Telegram ID нового админа:", reply_markup=reply.back_only())
+
+
+@router.message(St.set_admins)
+async def admin_remove(message: Message, db: Database, config: Config,
+                       state: FSMContext) -> None:
+    digits = "".join(c for c in message.text if c.isdigit())
+    if not digits:
+        await message.answer("⚠️ Используйте кнопки меню.")
+        return
+    await db.remove_admin(int(digits))
+    await message.answer(f"🗑 Админ {digits} удалён.")
+    db_admins = await db.get_admins()
+    await message.answer(await _admins_text(db, config),
+                         reply_markup=reply.admins_menu(db_admins))
+
+
+@router.message(St.set_admin_add, F.text == reply.BACK)
+async def admin_add_back(message: Message, db: Database, config: Config,
+                         state: FSMContext) -> None:
+    await admins_menu(message, db, config, state)
+
+
+@router.message(St.set_admin_add)
+async def admin_add_finish(message: Message, db: Database, config: Config,
+                           state: FSMContext) -> None:
     text = message.text.strip()
     if not text.isdigit():
-        await message.answer("⚠️ ID — это положительное число. Попробуйте еще раз:")
+        await message.answer("⚠️ ID — это число. Повторите:")
         return
-    await state.clear()
     await db.add_admin(int(text))
-    db_admins = await db.get_admins()
-    await message.answer(
-        f"✅ Админ <code>{text}</code> добавлен!\n\n" + await _admins_text(db, config),
-        reply_markup=inline.admins_menu(db_admins),
-    )
-
-
-@router.callback_query(F.data.startswith("admin_del:"))
-async def delete_admin(callback: CallbackQuery, db: Database, config: Config) -> None:
-    user_id = int(callback.data.split(":")[1])
-    await db.remove_admin(user_id)
-    db_admins = await db.get_admins()
-    await callback.answer(f"Админ {user_id} удален")
-    await safe_edit(callback.message, await _admins_text(db, config), inline.admins_menu(db_admins))
+    await message.answer(f"✅ Админ <code>{text}</code> добавлен.")
+    await admins_menu(message, db, config, state)

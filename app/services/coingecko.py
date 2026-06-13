@@ -10,6 +10,7 @@
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -87,6 +88,38 @@ class CoinGeckoClient:
                 self._id_cache[ticker] = coin["id"]
                 return coin["id"]
         return None
+
+    async def find_date_for_price(self, ticker: str, target_price: float) -> str | None:
+        """Находит ПОСЛЕДНЮЮ дату за год, когда монета стоила примерно target_price.
+
+        Берет график цен за 365 дней (/coins/{id}/market_chart) и выбирает точку
+        с минимальным отклонением от целевой цены; при равном отклонении —
+        более позднюю (список отсортирован по времени по возрастанию).
+        Возвращает дату в формате ДД.ММ.ГГГГ или None, если данных нет.
+        """
+        coin_id = await self.resolve_ticker(ticker)
+        if not coin_id:
+            return None
+
+        data = await self._request(
+            f"/coins/{coin_id}/market_chart",
+            {"vs_currency": "usd", "days": "365"},
+        )
+        prices = data.get("prices", [])  # список пар [timestamp_ms, price]
+        if not prices:
+            return None
+
+        best_ts = None
+        best_diff = float("inf")
+        for ts, price in prices:
+            diff = abs(price - target_price)
+            # <= гарантирует выбор более поздней точки при равном отклонении
+            if diff <= best_diff:
+                best_diff = diff
+                best_ts = ts
+
+        dt = datetime.fromtimestamp(best_ts / 1000, tz=timezone.utc)
+        return dt.strftime("%d.%m.%Y")
 
     async def get_prices(self, tickers: list[str]) -> dict[str, PriceInfo]:
         """Возвращает цены и динамику 24ч для списка тикеров.
