@@ -32,6 +32,7 @@ class St(StatesGroup):
 
     # Настройки
     set_freq = State()
+    set_freq_input = State()
     set_threshold = State()
     set_threshold_input = State()
     set_admins = State()

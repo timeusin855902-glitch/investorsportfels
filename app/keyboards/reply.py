@@ -42,6 +42,7 @@ SET_ADMINS = "👮 Админы"
 SET_CHAT_HERE = "📍 Отчёты в этот чат"
 ADD_ADMIN = "➕ Добавить админа"
 THRESHOLD_CUSTOM = "✍️ Ввести вручную"
+FREQ_CUSTOM = "✍️ Задать часы"
 
 
 def _kb(rows: list[list[str]]) -> ReplyKeyboardMarkup:
@@ -100,7 +101,7 @@ def settings_menu() -> ReplyKeyboardMarkup:
 
 
 def freq_menu() -> ReplyKeyboardMarkup:
-    return _kb([["6 часов", "12 часов"], ["24 часа"], [BACK]])
+    return _kb([["6 часов", "12 часов"], ["24 часа", "48 часов"], [FREQ_CUSTOM], [BACK]])
 
 
 def threshold_menu() -> ReplyKeyboardMarkup:

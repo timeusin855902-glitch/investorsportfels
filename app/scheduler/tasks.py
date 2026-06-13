@@ -84,12 +84,22 @@ async def check_volatility(bot: Bot, db: Database, api: CoinGeckoClient,
 
         direction = "рост" if info.change_24h > 0 else "падение"
         emoji = "🚀" if info.change_24h > 0 else "📉"
-        # Rich-алерт: заголовок + цитата с жирными триггерами для привлечения внимания
+
+        # Собираем держателей актива и текущую стоимость позиции каждого в $
+        holders = await db.get_holders_by_ticker(info.ticker)
+        if holders:
+            holders_str = ", ".join(
+                f"{esc(h['investor_name'])} (${fmt_usd(h['amount'] * info.price_usd)})"
+                for h in holders
+            )
+        else:
+            holders_str = "—"
+
+        # Rich-алерт: заголовок-триггер + цитата с ценой и держателями
         html = (
-            "<h3>🚨 Внимание! Резкое движение цены</h3>"
-            f"<blockquote>{emoji} Актив <b>{esc(info.ticker)}</b> показал {direction} "
-            f"на <b>{info.change_24h:+.1f}%</b> за последние 24 часа!<br>"
-            f"Текущая цена: <b>${fmt_usd(info.price_usd)}</b>"
+            f"<h3>🚨 {emoji} {esc(info.ticker)}: {direction} {info.change_24h:+.1f}% за 24ч</h3>"
+            f"<blockquote>Текущая цена: <b>${fmt_usd(info.price_usd)}</b><br>"
+            f"Лежит у: {holders_str}"
             "<cite>Источник: CoinGecko</cite></blockquote>"
         )
         try:

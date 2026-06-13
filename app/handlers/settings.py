@@ -57,14 +57,42 @@ async def freq_back(message: Message, db: Database, config: Config, state: FSMCo
     await show_settings(message, db, config, state)
 
 
+@router.message(St.set_freq, F.text == reply.FREQ_CUSTOM)
+async def freq_custom(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.set_freq_input)
+    await message.answer("✍️ Введите интервал отчёта в часах (число от 1 до 168):",
+                         reply_markup=reply.back_only())
+
+
 @router.message(St.set_freq)
 async def freq_set(message: Message, db: Database, config: Config,
                    scheduler: AsyncIOScheduler, state: FSMContext) -> None:
     digits = "".join(c for c in message.text if c.isdigit())
-    if digits not in {"6", "12", "24"}:
-        await message.answer("⚠️ Выберите вариант кнопкой.")
+    if digits not in {"6", "12", "24", "48"}:
+        await message.answer("⚠️ Выберите вариант кнопкой или «✍️ Задать часы».")
         return
-    hours = int(digits)
+    await _apply_freq(message, db, config, scheduler, state, int(digits))
+
+
+@router.message(St.set_freq_input, F.text == reply.BACK)
+async def freq_input_back(message: Message, db: Database, config: Config,
+                          state: FSMContext) -> None:
+    await show_settings(message, db, config, state)
+
+
+@router.message(St.set_freq_input)
+async def freq_input(message: Message, db: Database, config: Config,
+                     scheduler: AsyncIOScheduler, state: FSMContext) -> None:
+    text = message.text.strip()
+    if not text.isdigit() or not 1 <= int(text) <= 168:
+        await message.answer("⚠️ Введите целое число от 1 до 168:")
+        return
+    await _apply_freq(message, db, config, scheduler, state, int(text))
+
+
+async def _apply_freq(message: Message, db: Database, config: Config,
+                      scheduler: AsyncIOScheduler, state: FSMContext, hours: int) -> None:
+    """Сохраняет интервал отчёта и перепланирует фоновую задачу."""
     await db.set_setting("report_freq_hours", str(hours))
     reschedule_report(scheduler, hours)
     await message.answer(f"✅ Отчёты — каждые {hours} ч.")

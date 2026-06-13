@@ -210,6 +210,23 @@ class Database:
         )
         return [row["asset_ticker"] for row in await cursor.fetchall()]
 
+    async def get_holders_by_ticker(self, ticker: str) -> list[aiosqlite.Row]:
+        """Инвесторы, держащие данный актив, и их остатки (по убыванию остатка)."""
+        cursor = await self.conn.execute(
+            """
+            SELECT i.name AS investor_name,
+                   SUM(CASE t.kind WHEN 'buy' THEN t.amount ELSE -t.amount END) AS amount
+            FROM investors i
+            JOIN transactions t ON t.investor_id = i.id
+            WHERE t.asset_ticker = ?
+            GROUP BY i.id
+            HAVING amount > ?
+            ORDER BY amount DESC
+            """,
+            (ticker.upper(), EPS),
+        )
+        return list(await cursor.fetchall())
+
     async def get_all_holdings(self) -> list[aiosqlite.Row]:
         """Текущие остатки всех инвесторов (для сводных отчетов).
 

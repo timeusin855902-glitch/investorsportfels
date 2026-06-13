@@ -57,22 +57,29 @@ async def build_investor_card(db: Database, api: CoinGeckoClient, investor_id: i
         logger.warning("Ошибка CoinGecko при построении карточки: %s", e)
         prices = {}
 
+    # Считаем стоимость каждой позиции и сортируем по убыванию стоимости.
+    # Позиции без доступной цены отправляем в конец списка.
+    items: list[tuple[str, float, float | None]] = []  # (тикер, кол-во, стоимость|None)
+    for asset in assets:
+        info = prices.get(asset["asset_ticker"])
+        value = asset["amount"] * info.price_usd if info is not None else None
+        items.append((asset["asset_ticker"], asset["amount"], value))
+    items.sort(key=lambda x: x[2] if x[2] is not None else float("-inf"), reverse=True)
+
     # Строки таблицы: Токен | Кол-во | Курс ($) | Всего ($)
     rows: list[list[str]] = []
     total = 0.0
-    for asset in assets:
-        ticker, amount = asset["asset_ticker"], asset["amount"]
+    for ticker, amount, value in items:
         info = prices.get(ticker)
-        if info is None:
+        if info is None or value is None:
             rows.append([ticker, fmt_amount(amount), "—", "—"])
             continue
-        position_value = amount * info.price_usd
-        total += position_value
+        total += value
         rows.append([
             ticker,
             fmt_amount(amount),
             fmt_usd(info.price_usd),
-            fmt_usd(position_value),
+            fmt_usd(value),
         ])
 
     table = render_table(["Токен", "Кол-во", "Курс ($)", "Всего ($)"], rows)
@@ -119,53 +126,75 @@ async def build_top_movers(db: Database, api: CoinGeckoClient, gainers: bool) ->
 async def build_summary_report(
     db: Database, api: CoinGeckoClient, title: str = "📋 Общий отчёт"
 ) -> str:
-    """Rich-сводка: таблица Инвестор | Баланс ($) | Изм. 24ч (%) + общий итог."""
+    """Монето-центричный отчёт: монеты по убыванию динамики за 24ч.
+
+    Колонки: Монета | Δ24ч % | Сумма $ (по всем инвесторам) | Инвесторы (доля %).
+    В 4-й колонке у каждого инвестора в скобках — его доля в общем количестве
+    данного актива среди всех инвесторов.
+    """
     holdings = await db.get_all_holdings()
-    if not holdings:
-        return "<p>Инвесторы пока не добавлены.</p>"
 
-    tickers = list({h["asset_ticker"] for h in holdings if h["asset_ticker"]})
-    prices = {}
-    if tickers:
-        try:
-            prices = await api.get_prices(tickers)
-        except CoinGeckoError as e:
-            logger.warning("Ошибка CoinGecko при построении сводки: %s", e)
-
-    # Агрегируем балансы по инвесторам (порядок dict == ORDER BY name из SQL)
-    agg: dict[str, dict[str, float]] = {}
-    grand_total = 0.0
-    grand_total_yesterday = 0.0
-
+    # Группируем остатки по тикеру: общий объём + список держателей
+    per_ticker: dict[str, dict] = {}
     for row in holdings:
-        stats = agg.setdefault(row["investor_name"], {"total": 0.0, "yesterday": 0.0})
         if row["asset_ticker"] is None:
-            continue  # инвестор без активов — попадёт в таблицу с нулевым балансом
-        info = prices.get(row["asset_ticker"])
-        if info is None:
-            continue  # цена недоступна — позицию не учитываем
-        value = row["amount"] * info.price_usd
-        stats["total"] += value
-        grand_total += value
-        # Стоимость сутки назад восстанавливаем из текущей цены и изменения за 24ч
-        if info.change_24h > -100:
-            yesterday = value / (1 + info.change_24h / 100)
-            stats["yesterday"] += yesterday
-            grand_total_yesterday += yesterday
+            continue
+        bucket = per_ticker.setdefault(
+            row["asset_ticker"], {"total_amount": 0.0, "holders": []}
+        )
+        bucket["total_amount"] += row["amount"]
+        bucket["holders"].append((row["investor_name"], row["amount"]))
 
-    rows: list[list[str]] = []
-    for name, stats in agg.items():
-        if stats["yesterday"] > 0:
-            change_str = fmt_change((stats["total"] / stats["yesterday"] - 1) * 100)
-        else:
-            change_str = "—"
-        rows.append([name, fmt_usd(stats["total"]), change_str])
+    if not per_ticker:
+        return f"<h3>{esc(title)}</h3><p>В портфелях пока нет активов.</p>"
 
-    table = render_table(["Инвестор", "Баланс ($)", "Изм. 24ч (%)"], rows)
+    try:
+        prices = await api.get_prices(list(per_ticker))
+    except CoinGeckoError as e:
+        logger.warning("Ошибка CoinGecko при построении отчёта: %s", e)
+        prices = {}
 
-    parts = [f"<h3>{esc(title)}</h3>", table,
-             f"<p>💰 <b>Суммарный баланс: {fmt_usd(grand_total)} $</b></p>"]
-    if grand_total_yesterday > 0:
-        day_change = (grand_total / grand_total_yesterday - 1) * 100
-        parts.append(f"<p>📊 <b>Динамика за 24ч: {fmt_change(day_change)}</b></p>")
-    return "".join(parts)
+    # Готовим данные строк: (тикер, изменение, стоимость, строка держателей)
+    rows_data: list[tuple[str, float | None, float | None, str]] = []
+    grand_total = 0.0
+    for ticker, bucket in per_ticker.items():
+        info = prices.get(ticker)
+        change = info.change_24h if info is not None else None
+        total_value = bucket["total_amount"] * info.price_usd if info is not None else None
+        if total_value is not None:
+            grand_total += total_value
+
+        # Держатели по убыванию доли, в скобках — процент от общего количества актива
+        holders = sorted(bucket["holders"], key=lambda h: h[1], reverse=True)
+        total_amount = bucket["total_amount"]
+        holders_str = ", ".join(
+            f"{name} ({(amount / total_amount * 100) if total_amount > 0 else 0:.0f}%)"
+            for name, amount in holders
+        )
+        rows_data.append((ticker, change, total_value, holders_str))
+
+    # Сортируем монеты по убыванию динамики за 24ч (монеты без цены — в конец)
+    rows_data.sort(
+        key=lambda r: r[1] if r[1] is not None else float("-inf"), reverse=True
+    )
+
+    table_rows = [
+        [
+            ticker,
+            fmt_change(change) if change is not None else "—",
+            fmt_usd(value) if value is not None else "—",
+            holders_str,
+        ]
+        for ticker, change, value, holders_str in rows_data
+    ]
+    table = render_table(
+        ["Монета", "Δ24ч %", "Сумма $", "Инвесторы (доля)"],
+        table_rows,
+        aligns=["left", "right", "right", "left"],
+    )
+
+    return (
+        f"<h3>{esc(title)}</h3>"
+        + table
+        + f"<p>💰 <b>Суммарно по всем активам: {fmt_usd(grand_total)} $</b></p>"
+    )
