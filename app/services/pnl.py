@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from app.database import Database
 from app.database.db import EPS
 from app.services.coingecko import CoinGeckoClient, CoinGeckoError
+from app.services.market import prices_for
 from app.services.reports import fmt_change, fmt_usd
 from app.services.rich import esc, render_table
 
@@ -115,18 +116,18 @@ async def build_investor_pnl(db: Database, api: CoinGeckoClient, investor_id: in
 
     tickers = list({t["asset_ticker"] for t in transactions})
     try:
-        prices = await api.get_prices(tickers)
+        prices = await prices_for(db, api, tickers)
     except CoinGeckoError as e:
         logger.warning("Ошибка CoinGecko при расчёте P&L: %s", e)
         prices = {}
 
     pnl = _aggregate(transactions, prices)
 
-    # Таблица: Токен | Ср.вход | Остаток | Тек.цена | P&L % | P&L $
+    # Таблица: Токен | Ср.вход | Тек.цена | P&L % | P&L $ (без количества монет)
     rows: list[list[str]] = []
     for a in pnl.assets:
         if not a.has_cost:
-            rows.append([a.ticker, "н/д", _q(a.remaining), "—", "н/д", "н/д"])
+            rows.append([a.ticker, "н/д", "—", "н/д", "н/д"])
             continue
         price_str = fmt_usd(a.current_price) if a.current_price is not None else "—"
         pct = a.unrealized_pct
@@ -134,14 +135,13 @@ async def build_investor_pnl(db: Database, api: CoinGeckoClient, investor_id: in
         rows.append([
             a.ticker,
             fmt_usd(a.avg_buy),
-            _q(a.remaining),
             price_str,
             pct_str,
             _pnl(a.total),
         ])
 
     table = render_table(
-        ["Токен", "Ср.вход", "Остаток", "Тек.цена", "P&L %", "P&L $"],
+        ["Токен", "Ср.вход", "Тек.цена", "P&L %", "P&L $"],
         rows,
     )
 
@@ -173,7 +173,7 @@ async def build_pnl_summary(db: Database, api: CoinGeckoClient) -> str:
     prices = {}
     if tickers:
         try:
-            prices = await api.get_prices(list(tickers))
+            prices = await prices_for(db, api, list(tickers))
         except CoinGeckoError as e:
             logger.warning("Ошибка CoinGecko при сводном P&L: %s", e)
 
@@ -204,8 +204,3 @@ def _pnl(value: float) -> str:
     """P&L со знаком и маркером направления, например «+1,250.00 $»."""
     sign = "+" if value >= 0 else "-"
     return f"{sign}{fmt_usd(abs(value))} $"
-
-
-def _q(value: float) -> str:
-    """Количество монет без хвостовых нулей."""
-    return f"{value:,.8f}".rstrip("0").rstrip(".")

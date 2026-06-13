@@ -81,6 +81,18 @@ def tickers_list(tickers_with_amounts: list[tuple[str, float]]) -> ReplyKeyboard
     return _kb(rows)
 
 
+def coin_label(name: str, symbol: str) -> str:
+    """Подпись кнопки выбора монеты: «Wormhole (W)»."""
+    return f"{name} ({symbol.upper()})"
+
+
+def coins_list(candidates: list) -> ReplyKeyboardMarkup:
+    """Список монет-кандидатов для выбора при неоднозначном тикере."""
+    rows = [[coin_label(c["name"], c["symbol"])] for c in candidates]
+    rows.append([BACK])
+    return _kb(rows)
+
+
 def analytics_menu() -> ReplyKeyboardMarkup:
     return _kb([[TOP_GAINERS, TOP_LOSERS], [SUMMARY], [HOME]])
 

@@ -120,7 +120,20 @@ async def card_pnl(message: Message, db: Database, api: CoinGeckoClient,
 async def add_asset_start(message: Message, state: FSMContext) -> None:
     await state.set_state(St.a_ticker)
     await message.answer(
-        "✍️ Введите тикер монеты (например, <code>BTC</code> или <code>ZEC</code>):",
+        "✍️ Введите тикер или название монеты "
+        "(например, <code>BTC</code>, <code>W</code> или <code>wormhole</code>):",
+        reply_markup=reply.back_only(),
+    )
+
+
+async def _choose_coin(message: Message, state: FSMContext,
+                       coin_id: str, symbol: str) -> None:
+    """Фиксирует выбранную монету и переходит к вводу цены."""
+    await state.update_data(t_ticker=symbol.upper(), t_coin_id=coin_id)
+    await state.set_state(St.a_price)
+    await message.answer(
+        f"Монета <b>{symbol.upper()}</b> выбрана ✅\n"
+        "💵 Введите цену покупки за 1 монету (в $):",
         reply_markup=reply.back_only(),
     )
 
@@ -132,25 +145,47 @@ async def add_asset_ticker_back(message: Message, db: Database, api: CoinGeckoCl
 
 
 @router.message(St.a_ticker)
-async def add_asset_ticker(message: Message, api: CoinGeckoClient, state: FSMContext) -> None:
-    ticker = message.text.strip().upper()
-    if not ticker.isalnum() or len(ticker) > 15:
-        await message.answer("⚠️ Тикер — до 15 букв/цифр. Повторите:")
+async def add_asset_ticker(message: Message, db: Database, state: FSMContext) -> None:
+    """Поиск монеты в локальном кэше (без обращения к CoinGecko)."""
+    query = message.text.strip()
+    candidates = await db.search_coins(query)
+    if not candidates:
+        await message.answer(
+            "⚠️ Монета не найдена в локальном кэше. Проверьте тикер/название "
+            "(если бот только что запущен, кэш монет ещё может обновляться)."
+        )
         return
-    try:
-        coin_id = await api.resolve_ticker(ticker)
-    except CoinGeckoError as e:
-        await message.answer(f"⚠️ {e}\nПопробуйте ещё раз:")
+    if len(candidates) == 1:
+        c = candidates[0]
+        await _choose_coin(message, state, c["id"], c["symbol"])
         return
-    if coin_id is None:
-        await message.answer(f"⚠️ Монета <b>{ticker}</b> не найдена на CoinGecko. Проверьте тикер:")
-        return
-    await state.update_data(t_ticker=ticker)
-    await state.set_state(St.a_price)
-    await message.answer(
-        f"Монета <b>{ticker}</b> найдена ✅\n💵 Введите цену покупки за 1 монету (в $):",
-        reply_markup=reply.back_only(),
+    # Неоднозначный тикер (например, «W») — предлагаем выбрать конкретную монету
+    await state.update_data(
+        candidates=[{"id": c["id"], "symbol": c["symbol"], "name": c["name"]} for c in candidates]
     )
+    await state.set_state(St.a_pick)
+    await message.answer(
+        f"🔎 Найдено несколько монет по запросу «{query}». Выберите нужную:",
+        reply_markup=reply.coins_list(candidates),
+    )
+
+
+@router.message(St.a_pick, F.text == reply.BACK)
+async def add_asset_pick_back(message: Message, db: Database, api: CoinGeckoClient,
+                              state: FSMContext) -> None:
+    await _back_to_card(message, db, api, state)
+
+
+@router.message(St.a_pick)
+async def add_asset_pick(message: Message, state: FSMContext) -> None:
+    """Выбор конкретной монеты из списка кандидатов."""
+    data = await state.get_data()
+    chosen = message.text.strip()
+    for c in data.get("candidates", []):
+        if reply.coin_label(c["name"], c["symbol"]) == chosen:
+            await _choose_coin(message, state, c["id"], c["symbol"])
+            return
+    await message.answer("⚠️ Выберите монету кнопкой из списка.")
 
 
 @router.message(St.a_price, F.text == reply.BACK)
@@ -202,12 +237,13 @@ async def add_asset_date(message: Message, db: Database, api: CoinGeckoClient,
                          state: FSMContext) -> None:
     data = await state.get_data()
     ticker, price, amount = data["t_ticker"], data["t_price"], data["t_amount"]
+    coin_id = data.get("t_coin_id")
 
     if message.text.strip() == reply.SKIP:
         # Автоопределение даты по цене через исторический график
         await message.answer("⏳ Ищу дату по цене через CoinGecko…")
         try:
-            date = await api.find_date_for_price(ticker, price)
+            date = await api.find_date_for_price(coin_id, price)
         except CoinGeckoError:
             date = None
         if date:
@@ -221,7 +257,7 @@ async def add_asset_date(message: Message, db: Database, api: CoinGeckoClient,
             await message.answer("⚠️ Неверный формат. Введите дату как ДД.ММ.ГГГГ:")
             return
 
-    await db.add_transaction(data["inv_id"], ticker, "buy", price, amount, date)
+    await db.add_transaction(data["inv_id"], ticker, "buy", price, amount, date, coin_id=coin_id)
     await message.answer(
         f"✅ Куплено: <b>{ticker}</b> — {amount:g} шт по {fmt_usd(price)} $ "
         f"(сумма {fmt_usd(price * amount)} $), дата {date}"
@@ -332,7 +368,8 @@ async def sell_date(message: Message, db: Database, api: CoinGeckoClient,
     amount = data["sell_amount"]
     inv_id = data["inv_id"]
 
-    await db.add_transaction(inv_id, ticker, "sell", price, amount, date)
+    coin_id = await db.get_position_coin_id(inv_id, ticker)
+    await db.add_transaction(inv_id, ticker, "sell", price, amount, date, coin_id=coin_id)
 
     # Реализованный P&L сделки относительно средней цены входа
     pnl_line = ""

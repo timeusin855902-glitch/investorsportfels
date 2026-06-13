@@ -147,3 +147,13 @@ async def send_rich_message(
         payload["reply_markup"] = markup
     payload.update(extra)
     return await _call(bot, "sendRichMessage", payload)
+
+
+async def create_forum_topic(bot: Bot, chat_id: int | str, name: str) -> int:
+    """Создаёт тему в форум-супергруппе (createForumTopic) и возвращает её id.
+
+    Бот должен быть админом группы с правом can_manage_topics. Имя темы — 1..128
+    символов. Возвращает message_thread_id созданной темы.
+    """
+    result = await _call(bot, "createForumTopic", {"chat_id": chat_id, "name": name[:128]})
+    return result["message_thread_id"]

@@ -8,6 +8,7 @@ import logging
 
 from app.database import Database
 from app.services.coingecko import CoinGeckoClient, CoinGeckoError
+from app.services.market import prices_for
 from app.services.rich import esc, render_table
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ async def build_investor_card(db: Database, api: CoinGeckoClient, investor_id: i
 
     tickers = [a["asset_ticker"] for a in assets]
     try:
-        prices = await api.get_prices(tickers)
+        prices = await prices_for(db, api, tickers)
     except CoinGeckoError as e:
         logger.warning("Ошибка CoinGecko при построении карточки: %s", e)
         prices = {}
@@ -101,7 +102,7 @@ async def build_top_movers(db: Database, api: CoinGeckoClient, gainers: bool) ->
         return "<p>В портфелях пока нет ни одной монеты.</p>"
 
     try:
-        prices = await api.get_prices(tickers)
+        prices = await prices_for(db, api, tickers)
     except CoinGeckoError as e:
         return f"<p>⚠️ Не удалось получить данные: {esc(e)}</p>"
 
@@ -149,7 +150,7 @@ async def build_summary_report(
         return f"<h3>{esc(title)}</h3><p>В портфелях пока нет активов.</p>"
 
     try:
-        prices = await api.get_prices(list(per_ticker))
+        prices = await prices_for(db, api, list(per_ticker))
     except CoinGeckoError as e:
         logger.warning("Ошибка CoinGecko при построении отчёта: %s", e)
         prices = {}
@@ -198,3 +199,55 @@ async def build_summary_report(
         + table
         + f"<p>💰 <b>Суммарно по всем активам: {fmt_usd(grand_total)} $</b></p>"
     )
+
+
+# ---------------------------------------------------------------------------
+# Персональный отчёт инвестора (в его форум-тему)
+# ---------------------------------------------------------------------------
+
+async def build_personal_report(db: Database, api: CoinGeckoClient, investor_id: int) -> str:
+    """Личный отчёт инвестора: Монета | Сумма $ | Δ24ч | Δ7д (без количества монет)."""
+    investor = await db.get_investor(investor_id)
+    if investor is None:
+        return "<p>⚠️ Инвестор не найден.</p>"
+
+    assets = await db.get_portfolio(investor_id)
+    header = f"<h3>📈 Отчёт по портфелю: {esc(investor['name'])}</h3>"
+    if not assets:
+        return f"{header}<p>Портфель пуст.</p>"
+
+    tickers = [a["asset_ticker"] for a in assets]
+    try:
+        prices = await prices_for(db, api, tickers)
+    except CoinGeckoError as e:
+        logger.warning("Ошибка CoinGecko при персональном отчёте: %s", e)
+        prices = {}
+
+    # Считаем стоимость позиций и сортируем по убыванию динамики за 24ч
+    data: list[tuple[str, float | None, float | None, float | None]] = []
+    total = 0.0
+    for asset in assets:
+        info = prices.get(asset["asset_ticker"])
+        if info is None:
+            data.append((asset["asset_ticker"], None, None, None))
+            continue
+        value = asset["amount"] * info.price_usd
+        total += value
+        data.append((asset["asset_ticker"], value, info.change_24h, info.change_7d))
+
+    data.sort(key=lambda r: r[2] if r[2] is not None else float("-inf"), reverse=True)
+
+    rows = [
+        [
+            ticker,
+            fmt_usd(value) if value is not None else "—",
+            fmt_change(c24) if c24 is not None else "—",
+            fmt_change(c7) if c7 is not None else "—",
+        ]
+        for ticker, value, c24, c7 in data
+    ]
+    table = render_table(
+        ["Монета", "Сумма $", "Δ24ч", "Δ7д"], rows,
+        aligns=["left", "right", "right", "right"],
+    )
+    return f"{header}{table}<p>💰 <b>Итого: {fmt_usd(total)} $</b></p>"

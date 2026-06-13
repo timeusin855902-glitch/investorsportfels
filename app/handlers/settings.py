@@ -22,11 +22,14 @@ async def _settings_text(db: Database, config: Config) -> str:
     threshold = await db.get_setting("alert_threshold", "30")
     chat_id = await db.get_setting("analytics_chat_id") or config.analytics_chat_id
     chat_str = str(chat_id) if chat_id else "не задан ⚠️"
+    forum = await db.get_setting("forum_chat_id")
+    forum_str = forum if forum else "не задана (команда /setforum в группе)"
     return (
         "⚙️ <b>Настройки</b>\n\n"
         f"⏰ Частота отчётов: каждые <b>{freq} ч</b>\n"
         f"🚨 Порог алертов: <b>±{threshold}%</b> за 24ч\n"
-        f"📍 Чат для отчётов: <b>{chat_str}</b>\n\n"
+        f"📍 Чат для отчётов: <b>{chat_str}</b>\n"
+        f"🧵 Форум-группа тем: <b>{forum_str}</b>\n\n"
         "Выберите параметр:"
     )
 
