@@ -68,12 +68,21 @@ async def ensure_topic(bot: Bot, db: Database, forum_chat_id: int,
 async def send_daily_report(bot: Bot, db: Database, api: CoinGeckoClient,
                             config: Config) -> None:
     """Общий отчёт в аналитический чат + персональные отчёты в темы инвесторов."""
+    # Порог движения за 24ч: монеты со слабым движением в плановый отчёт не попадают
+    try:
+        min_change = float(await db.get_setting("report_threshold", "0"))
+    except ValueError:
+        min_change = 0.0
+
     chat_id = await _get_analytics_chat_id(db, config)
     if chat_id is not None:
         try:
-            html = await build_summary_report(db, api, title="🗞 Регулярный отчёт по портфелям")
-            await send_rich_message(bot, chat_id, html)
-            logger.info("Сводный отчёт отправлен в чат %s", chat_id)
+            html = await build_summary_report(
+                db, api, title="🗞 Регулярный отчёт по портфелям", min_change=min_change
+            )
+            if html:  # пустая строка = под фильтр движения ничего не подошло
+                await send_rich_message(bot, chat_id, html)
+                logger.info("Сводный отчёт отправлен в чат %s", chat_id)
         except Exception:
             logger.exception("Ошибка при отправке сводного отчёта")
 
@@ -82,11 +91,15 @@ async def send_daily_report(bot: Bot, db: Database, api: CoinGeckoClient,
     if forum_chat_id is None:
         return
     for inv in await db.get_investors():
-        thread = await ensure_topic(bot, db, forum_chat_id, inv["id"], inv["name"], inv["thread_id"])
-        if thread is None:
-            continue
         try:
-            html = await build_personal_report(db, api, inv["id"])
+            html = await build_personal_report(db, api, inv["id"], min_change=min_change)
+            if not html:
+                continue  # у инвестора нет монет с движением >= порога — не шлём
+            thread = await ensure_topic(
+                bot, db, forum_chat_id, inv["id"], inv["name"], inv["thread_id"]
+            )
+            if thread is None:
+                continue
             await send_rich_message(bot, forum_chat_id, html, message_thread_id=thread)
         except Exception:
             logger.exception("Ошибка при отправке персонального отчёта инвестору %s", inv["id"])

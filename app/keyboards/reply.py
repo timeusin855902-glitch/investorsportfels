@@ -38,8 +38,10 @@ SUMMARY = "📋 Общий отчёт"
 # ---- Настройки ----
 SET_FREQ = "⏰ Частота отчётов"
 SET_THRESHOLD = "🚨 Порог алертов"
+SET_REPORT_THRESHOLD = "📈 Порог отчётов"
 SET_ADMINS = "👮 Админы"
 SET_CHAT_HERE = "📍 Отчёты в этот чат"
+NO_FILTER = "Без фильтра"
 ADD_ADMIN = "➕ Добавить админа"
 THRESHOLD_CUSTOM = "✍️ Ввести вручную"
 FREQ_CUSTOM = "✍️ Задать часы"
@@ -107,9 +109,14 @@ def pnl_investors(investors: list[aiosqlite.Row]) -> ReplyKeyboardMarkup:
 def settings_menu() -> ReplyKeyboardMarkup:
     return _kb([
         [SET_FREQ, SET_THRESHOLD],
+        [SET_REPORT_THRESHOLD],
         [SET_ADMINS, SET_CHAT_HERE],
         [HOME],
     ])
+
+
+def report_threshold_menu() -> ReplyKeyboardMarkup:
+    return _kb([[NO_FILTER, "3%"], ["5%", "10%"], [THRESHOLD_CUSTOM], [BACK]])
 
 
 def freq_menu() -> ReplyKeyboardMarkup:

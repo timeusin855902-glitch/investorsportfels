@@ -20,6 +20,8 @@ async def _settings_text(db: Database, config: Config) -> str:
     """Текст экрана настроек с текущими значениями."""
     freq = await db.get_setting("report_freq_hours", "24")
     threshold = await db.get_setting("alert_threshold", "30")
+    rep_threshold = await db.get_setting("report_threshold", "0")
+    rep_str = f"±{rep_threshold}% за 24ч" if rep_threshold not in ("0", "0.0", "") else "выкл"
     chat_id = await db.get_setting("analytics_chat_id") or config.analytics_chat_id
     chat_str = str(chat_id) if chat_id else "не задан ⚠️"
     forum = await db.get_setting("forum_chat_id")
@@ -28,6 +30,7 @@ async def _settings_text(db: Database, config: Config) -> str:
         "⚙️ <b>Настройки</b>\n\n"
         f"⏰ Частота отчётов: каждые <b>{freq} ч</b>\n"
         f"🚨 Порог алертов: <b>±{threshold}%</b> за 24ч\n"
+        f"📈 Порог отчётов: <b>{rep_str}</b>\n"
         f"📍 Чат для отчётов: <b>{chat_str}</b>\n"
         f"🧵 Форум-группа тем: <b>{forum_str}</b>\n\n"
         "Выберите параметр:"
@@ -154,6 +157,68 @@ async def threshold_input(message: Message, db: Database, config: Config,
         return
     await db.set_setting("alert_threshold", f"{pct:g}")
     await message.answer(f"✅ Порог алертов — ±{pct:g}%.")
+    await show_settings(message, db, config, state)
+
+
+# ---- Порог движения для плановых отчётов ----
+
+@router.message(St.settings, F.text == reply.SET_REPORT_THRESHOLD)
+async def report_threshold_menu(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.set_report_threshold)
+    await message.answer(
+        "📈 Порог движения за 24ч для плановых отчётов.\n"
+        "В отчёт попадут только монеты с |Δ24ч| ≥ порога. «Без фильтра» — показывать все.",
+        reply_markup=reply.report_threshold_menu(),
+    )
+
+
+@router.message(St.set_report_threshold, F.text == reply.BACK)
+async def report_threshold_back(message: Message, db: Database, config: Config,
+                                state: FSMContext) -> None:
+    await show_settings(message, db, config, state)
+
+
+@router.message(St.set_report_threshold, F.text == reply.THRESHOLD_CUSTOM)
+async def report_threshold_custom(message: Message, state: FSMContext) -> None:
+    await state.set_state(St.set_report_threshold_input)
+    await message.answer("✍️ Введите порог в процентах (0 = без фильтра, до 500):",
+                         reply_markup=reply.back_only())
+
+
+@router.message(St.set_report_threshold)
+async def report_threshold_set(message: Message, db: Database, config: Config,
+                               state: FSMContext) -> None:
+    if message.text == reply.NO_FILTER:
+        value = "0"
+    else:
+        digits = "".join(c for c in message.text if c.isdigit())
+        if digits not in {"3", "5", "10"}:
+            await message.answer("⚠️ Выберите вариант кнопкой или «✍️ Ввести вручную».")
+            return
+        value = digits
+    await db.set_setting("report_threshold", value)
+    await message.answer("✅ Порог отчётов обновлён.")
+    await show_settings(message, db, config, state)
+
+
+@router.message(St.set_report_threshold_input, F.text == reply.BACK)
+async def report_threshold_input_back(message: Message, db: Database, config: Config,
+                                      state: FSMContext) -> None:
+    await show_settings(message, db, config, state)
+
+
+@router.message(St.set_report_threshold_input)
+async def report_threshold_input(message: Message, db: Database, config: Config,
+                                 state: FSMContext) -> None:
+    try:
+        pct = float(message.text.replace(",", ".").replace("%", "").strip())
+    except ValueError:
+        pct = -1
+    if not 0 <= pct <= 500:
+        await message.answer("⚠️ Введите число от 0 до 500 (0 = без фильтра):")
+        return
+    await db.set_setting("report_threshold", f"{pct:g}")
+    await message.answer(f"✅ Порог отчётов: {'выкл' if pct == 0 else f'±{pct:g}%'}.")
     await show_settings(message, db, config, state)
 
 

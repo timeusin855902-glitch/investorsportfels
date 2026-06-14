@@ -125,13 +125,18 @@ async def build_top_movers(db: Database, api: CoinGeckoClient, gainers: bool) ->
 # ---------------------------------------------------------------------------
 
 async def build_summary_report(
-    db: Database, api: CoinGeckoClient, title: str = "📋 Общий отчёт"
+    db: Database, api: CoinGeckoClient, title: str = "📋 Общий отчёт",
+    min_change: float = 0.0,
 ) -> str:
     """Монето-центричный отчёт: монеты по убыванию динамики за 24ч.
 
     Колонки: Монета | Δ24ч % | Сумма $ (по всем инвесторам) | Инвесторы (доля %).
     В 4-й колонке у каждого инвестора в скобках — его доля в общем количестве
     данного актива среди всех инвесторов.
+
+    min_change — фильтр для плановых отчётов: при значении > 0 в таблицу попадают
+    только монеты с |Δ24ч| >= min_change. Если под фильтр ничего не подошло,
+    возвращается пустая строка (плановый отчёт тогда не отправляется).
     """
     holdings = await db.get_all_holdings()
 
@@ -174,6 +179,12 @@ async def build_summary_report(
         )
         rows_data.append((ticker, change, total_value, holders_str))
 
+    # Фильтр движения для плановых отчётов: оставляем монеты с |Δ24ч| >= порога
+    if min_change > 0:
+        rows_data = [r for r in rows_data if r[1] is not None and abs(r[1]) >= min_change]
+        if not rows_data:
+            return ""  # под фильтр ничего не подошло — плановый отчёт не шлём
+
     # Сортируем монеты по убыванию динамики за 24ч (монеты без цены — в конец)
     rows_data.sort(
         key=lambda r: r[1] if r[1] is not None else float("-inf"), reverse=True
@@ -205,8 +216,14 @@ async def build_summary_report(
 # Персональный отчёт инвестора (в его форум-тему)
 # ---------------------------------------------------------------------------
 
-async def build_personal_report(db: Database, api: CoinGeckoClient, investor_id: int) -> str:
-    """Личный отчёт инвестора: Монета | Сумма $ | Δ24ч | Δ7д (без количества монет)."""
+async def build_personal_report(db: Database, api: CoinGeckoClient, investor_id: int,
+                                min_change: float = 0.0) -> str:
+    """Личный отчёт инвестора: Монета | Сумма $ | Δ24ч | Δ7д (без количества монет).
+
+    min_change — фильтр для плановых отчётов: при значении > 0 в таблицу попадают
+    только монеты с |Δ24ч| >= min_change. Если ничего не подошло — пустая строка
+    (плановый отчёт инвестору тогда не отправляется).
+    """
     investor = await db.get_investor(investor_id)
     if investor is None:
         return "<p>⚠️ Инвестор не найден.</p>"
@@ -214,7 +231,7 @@ async def build_personal_report(db: Database, api: CoinGeckoClient, investor_id:
     assets = await db.get_portfolio(investor_id)
     header = f"<h3>📈 Отчёт по портфелю: {esc(investor['name'])}</h3>"
     if not assets:
-        return f"{header}<p>Портфель пуст.</p>"
+        return "" if min_change > 0 else f"{header}<p>Портфель пуст.</p>"
 
     tickers = [a["asset_ticker"] for a in assets]
     try:
@@ -225,17 +242,24 @@ async def build_personal_report(db: Database, api: CoinGeckoClient, investor_id:
 
     # Считаем стоимость позиций и сортируем по убыванию динамики за 24ч
     data: list[tuple[str, float | None, float | None, float | None]] = []
-    total = 0.0
     for asset in assets:
         info = prices.get(asset["asset_ticker"])
         if info is None:
             data.append((asset["asset_ticker"], None, None, None))
             continue
         value = asset["amount"] * info.price_usd
-        total += value
         data.append((asset["asset_ticker"], value, info.change_24h, info.change_7d))
 
+    # Фильтр движения для плановых отчётов
+    if min_change > 0:
+        data = [r for r in data if r[2] is not None and abs(r[2]) >= min_change]
+        if not data:
+            return ""
+
     data.sort(key=lambda r: r[2] if r[2] is not None else float("-inf"), reverse=True)
+
+    # Итог считаем по тем монетам, что попали в таблицу (важно при включённом фильтре)
+    total = sum(value for _, value, _, _ in data if value is not None)
 
     rows = [
         [
